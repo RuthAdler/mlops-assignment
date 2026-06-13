@@ -1,0 +1,39 @@
+---
+description: Project coding standards and safety rules
+alwaysApply: true
+---
+
+# Information Security
+- Ask for my permission before accessing or using in any form any
+  authentication data, like SSH or other keys, passwords, etc.
+
+# Python Style
+- Follow PEP 8 style guidelines (but use 120 character line length).
+- Use PEP 287 as the style guide for docstring formatting.
+- Write clear, descriptive docstrings for functions and classes.
+- Specify types for function arguments in Python.
+  - Avoid passing composite types, such as
+    `tuple[list[int], list[dict[str, list[str]]]]`, to functions or methods.
+    Instead define a `NamedTuple` or `dataclass`.
+  - Avoid passing dictionaries with predefined keys, not changing at run-time,
+    to functions or methods. Instead define a `NamedTuple` or `dataclass` to
+    encapsulate them.
+  - When passing a `pandas.DataFrame`, specify its schema using
+    `pandera.typing.DataFrame`.
+
+# Design
+- OOP: In case of functions operating on a single dataclass object (optionally
+  with some other arguments), prioritize object-oriented design.
+- Make functions and methods small (below 40 lines) and, when possible,
+  focused on a single task.
+- Keep files smaller than 300 lines.
+
+# Testing
+- Avoid testing private methods or functions (those prefixed with `_`).
+- Use pytest for testing Python code.
+
+# Code Quality
+- Avoid redundant / unused code.
+- Avoid code duplication.
+- Avoid making up APIs; if in doubt, search the docs locally or on the web.
+- Don't write code that you don't understand.
