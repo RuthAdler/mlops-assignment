@@ -20,6 +20,8 @@ from pathlib import Path
 
 import httpx
 
+from agent.graph import MAX_ITERATIONS
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EVAL_FILE = ROOT / "evals" / "eval_set.jsonl"
 DEFAULT_OUT_FILE = ROOT / "results" / "eval_baseline.json"
@@ -56,9 +58,65 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 # ---------- Implement these (Phase 5) ----------------------------------
 
-def eval_one(question: dict, agent_url: str) -> dict:
-    """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+def _attempts_from_history(history: list[dict]) -> list[str]:
+    """Extract the SQL emitted at each generate/revise step, in order."""
+    return [h["sql"] for h in history if h.get("node") in {"generate_sql", "revise"} and "sql" in h]
+
+
+def eval_one(question: dict, agent_url: str, tags: dict[str, str] | None = None) -> dict:
+    """Score one question by comparing executed agent SQL rows to gold SQL rows."""
+    q = question["question"]
+    db = question["db_id"]
+    gold_sql = question["gold_sql"]
+
+    gold_ok, gold_rows, gold_err = run_sql(db, gold_sql)
+    payload: dict = {"question": q, "db": db}
+    if tags:
+        payload["tags"] = tags
+
+    t0 = time.monotonic()
+    try:
+        resp = httpx.post(agent_url, json=payload, timeout=180.0)
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "question": q,
+            "db_id": db,
+            "gold_sql": gold_sql,
+            "gold_ok": gold_ok,
+            "gold_error": gold_err,
+            "agent_error": f"{type(e).__name__}: {e}",
+            "per_iteration": [],
+            "n_iterations": 0,
+            "final_correct": False,
+            "latency_seconds": time.monotonic() - t0,
+        }
+
+    per_iteration: list[dict] = []
+    for sql in _attempts_from_history(body.get("history", [])):
+        ok, rows, err = run_sql(db, sql)
+        per_iteration.append({
+            "sql": sql,
+            "ok": ok,
+            "error": err,
+            "correct": ok and gold_ok and matches(gold_rows, rows),
+        })
+
+    return {
+        "question": q,
+        "db_id": db,
+        "gold_sql": gold_sql,
+        "gold_ok": gold_ok,
+        "gold_error": gold_err,
+        "agent_sql": body.get("sql", ""),
+        "agent_ok": body.get("ok", False),
+        "agent_error": body.get("error"),
+        "n_iterations": body.get("iterations", len(per_iteration)),
+        "per_iteration": per_iteration,
+        "final_correct": per_iteration[-1]["correct"] if per_iteration else False,
+        "latency_seconds": time.monotonic() - t0,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +128,33 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    if n == 0:
+        return {"n_questions": 0}
+
+    by_iter = [0] * MAX_ITERATIONS
+    for r in results:
+        per_iter = r.get("per_iteration", [])
+        last_correct = False
+        for k in range(MAX_ITERATIONS):
+            if k < len(per_iter):
+                last_correct = bool(per_iter[k].get("correct"))
+            if last_correct:
+                by_iter[k] += 1
+
+    iter_distribution: dict[str, int] = {}
+    for r in results:
+        key = str(r.get("n_iterations", 0))
+        iter_distribution[key] = iter_distribution.get(key, 0) + 1
+
+    return {
+        "n_questions": n,
+        "overall_pass_rate": sum(1 for r in results if r.get("final_correct")) / n,
+        "per_iteration_pass_rate": {str(k): by_iter[k] / n for k in range(MAX_ITERATIONS)},
+        "mean_iterations": sum(r.get("n_iterations", 0) for r in results) / n,
+        "iteration_distribution": iter_distribution,
+        "n_agent_errors": sum(1 for r in results if r.get("agent_error")),
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
