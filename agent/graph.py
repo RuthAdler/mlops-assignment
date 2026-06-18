@@ -16,6 +16,7 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -111,6 +112,24 @@ def execute_node(state: AgentState) -> dict:
     return {"execution": execute_sql(state.db_id, state.sql)}
 
 
+def _parse_verify(text: str) -> tuple[bool, str]:
+    """Pull ``{"ok": bool, "issue": str}`` out of the verifier's reply.
+
+    Malformed verifier replies fail closed so the graph revises instead of
+    silently accepting a questionable SQL result.
+    """
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    payload = fenced.group(1) if fenced else text
+    match = re.search(r"\{.*\}", payload, re.DOTALL)
+    if not match:
+        return False, "verifier reply unparseable"
+    try:
+        obj = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return False, "verifier reply not JSON"
+    return bool(obj.get("ok", False)), str(obj.get("issue", ""))
+
+
 def verify_node(state: AgentState) -> dict:
     """Decide whether state.execution plausibly answers state.question.
 
@@ -124,7 +143,28 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution = state.execution
+    if execution is None:
+        issue = "no execution result"
+        return {
+            "verify_ok": False,
+            "verify_issue": issue,
+            "history": state.history + [{"node": "verify", "ok": False, "issue": issue}],
+        }
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            execution=execution.render(),
+        )),
+    ])
+    ok, issue = _parse_verify(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{"node": "verify", "ok": ok, "issue": issue}],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +177,40 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution_render = state.execution.render() if state.execution is not None else ""
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            previous_sql=state.sql,
+            execution=execution_render,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql}],
+    }
+
+
+def _should_keep_ranked_limit(state: AgentState) -> bool:
+    """Avoid revising valid top-1 ranking SQL just because ties might exist."""
+    question = state.question.lower()
+    sql = state.sql.lower()
+    issue = state.verify_issue.lower()
+    rank_words = ("highest", "lowest", "top", "first", "largest", "smallest")
+    explicit_ties = ("all tied", "all ties", "same maximum", "same minimum")
+    tie_speculation = ("tie", "multiple", "share the highest", "share the lowest")
+    return (
+        "order by" in sql
+        and "limit" in sql
+        and any(word in question for word in rank_words)
+        and not any(phrase in question for phrase in explicit_ties)
+        and any(phrase in issue for phrase in tie_speculation)
+    )
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +219,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS or _should_keep_ranked_limit(state):
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
