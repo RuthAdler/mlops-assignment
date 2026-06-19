@@ -111,7 +111,7 @@ Raw: `results/load_test_baseline_iter1.json`. **SLO missed by ~22 × on p95.**
 
 **Lower-RPS feasibility test (iter 3 config at 3 RPS).** Same vLLM still running, knocked load to `--rps 3 --duration 180`. Result: p50 **2.54 s ✅ under SLO**, p95 **12.0 s ❌ above SLO**, 86 % OK, 1 timeout. The system can serve traffic cleanly at 3 RPS but the tail is still dragged by 3-iteration agent runs (verify → revise → verify). Raw: `results/load_test_3rps.json`.
 
-Before/after evidence: `screenshots/grafana_before.png` (dashboard under the iter 1 burn at 10 RPS) and `screenshots/grafana_after.png` (dashboard during the 3 RPS feasibility test).
+**Note on visual evidence.** A live before/after Grafana capture during the load test could not be produced: the Grafana UI had a stale-state issue during the H100 slot that left dashboard panels rendering "No data" even though Prometheus was scraping correctly (verified by direct `/api/v1/query` curls returning real data — `vllm:num_requests_running` was 37 mid-test, `rate(vllm:request_success_total[1m])` was 19.6 req/s). The dashboard JSON itself is correct and was validated against the synthetic-metrics dry-run shown in `screenshots/grafana_serving.png`. The primary Phase 6 evidence is the load driver JSONs (`results/load_test_baseline_iter1.json` etc.) plus the raw Prometheus data, which together establish the SLO miss and the per-iteration delta.
 
 ### Final numbers and verdict
 
