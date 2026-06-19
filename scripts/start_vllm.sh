@@ -24,7 +24,7 @@ ARGS=(
     # Interleave long prefills with decode work to protect TTFT under load.
     --enable-chunked-prefill
     # FP8 KV roughly doubles cache headroom, the key constraint for 10+ concurrent agent calls.
-    --kv-cache-dtype fp8
+
     # Small CPU spillover buffer; real SLO tuning should avoid relying on swap for latency.
     --swap-space 8
 )
