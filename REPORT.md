@@ -84,35 +84,45 @@ The traces backing this — `generate_sql → verify → revise → verify` wate
 
 Load test driver: [`load_test/driver.py`](load_test/driver.py). Each iteration below records *saw → hypothesized → changed → result*.
 
-### Baseline
+### Iteration 0 — boot-stability fix (preceded the load tests)
 
-<!-- TODO Friday: results of first `uv run python load_test/driver.py --rps 10 --duration 300` against scripts/start_vllm.sh defaults. -->
-- Configuration: starting flags from §1.
-- Observed P95 e2e latency: **TBD s**
-- Observed sustained RPS: **TBD**
-- SLO hit on first try? **TBD**
+Saw `CUDA error: an illegal memory access` in vLLM Engine logs on the 2nd request whose schema preamble was a 99 % prefix-cache hit (`prefix_cache_stats: hits=1024/1033`). Hypothesised a known vLLM 0.10.2 incompatibility between `--kv-cache-dtype fp8` and `--enable-prefix-caching`. Removed `--kv-cache-dtype fp8`. Result: 8/8 sequential cached-prefix requests returned 200 OK, no further engine deaths. Cost: KV-cache budget dropped from 297,840 → 148,896 tokens; theoretical max concurrency at 8 K context dropped from **36.36 ×** to **18.18 ×**. This forced revisiting `--max-num-seqs` next.
+
+### Baseline (Iter 1) — config from §1 with fp8 KV removed
+
+| | Value |
+|---|---|
+| Configuration | `--max-num-seqs 64 --max-model-len 8192`, prefix cache + chunked prefill on, fp8 KV off |
+| Achieved RPS | 8.3 (requested 10) |
+| OK | 1115 / 3000 (37 %) |
+| Timeouts | 871 (29 %) |
+| HTTP errors | 332 (11 %) |
+| p50 e2e latency | 80.0 s |
+| **p95 e2e latency** | **110.7 s** |
+| p99 e2e latency | 115.9 s |
+
+Raw: `results/load_test_baseline_iter1.json`. **SLO missed by ~22 × on p95.**
 
 ### Iteration log
 
-<!-- TODO Friday: 3-4 entries, each grounded in a specific dashboard panel observation. -->
+**Iter 2 — wrong direction.** Saw 37 concurrent requests on `vllm:num_requests_running` against an 18.18× KV-derived ceiling, plus a non-zero preemption rate during the iter 1 burn. Hypothesised `--max-num-seqs=64` was overcommitting and that preemptions were the binding constraint. Changed `--max-num-seqs` from `64` to `32`. Result: per-request latency for completed requests dropped (p50 80 s → 58.6 s, good for the slots that ran) **but timeouts climbed 48 % (871 → 1285) and total OK dropped 43 % (1115 → 637).** Wrong direction — fewer slots starve total throughput when each agent request demands 2-3 LLM calls. Lesson: when an agent multiplies LLM load, the binding constraint is total served throughput, not per-request preemption. Raw: `results/load_test_iter2.json`.
 
-**Iter 1.** Saw [metric X] climb first as load ramped, observed on [panel Y].  Hypothesized [bottleneck Z].  Changed `--<flag>` from `<old>` to `<new>`.  Result: [metric X] moved to [W]; end-to-end p95 [moved / didn't move].
+**Iter 3 — also regresses, for a different reason.** Reverted `--max-num-seqs` to 64 and reduced `--max-model-len` from `8192` to `4096`, expecting per-sequence KV footprint to halve and concurrency budget to roughly double. Result: OK rose to 878 (above iter 2, still below iter 1's 1115). p95 stayed at 118.7 s. The change didn't deliver because our prompts are 1.5–3 K tokens — they never use the full 8 K context. Reducing `max-model-len` only shrinks vLLM's pre-allocated buffers; it does not free per-request KV at runtime when requests are already short. Lesson: tune the lever that actually binds — measure first, change second. Raw: `results/load_test_iter3.json`.
 
-**Iter 2.** …
+**Lower-RPS feasibility test (iter 3 config at 3 RPS).** Same vLLM still running, knocked load to `--rps 3 --duration 180`. Result: p50 **2.54 s ✅ under SLO**, p95 **12.0 s ❌ above SLO**, 86 % OK, 1 timeout. The system can serve traffic cleanly at 3 RPS but the tail is still dragged by 3-iteration agent runs (verify → revise → verify). Raw: `results/load_test_3rps.json`.
 
-**Iter 3.** …
-
-Before/after evidence around the change that moved the needle: `screenshots/grafana_before.png` and `screenshots/grafana_after.png`.
+Before/after evidence: `screenshots/grafana_before.png` (dashboard under the iter 1 burn at 10 RPS) and `screenshots/grafana_after.png` (dashboard during the 3 RPS feasibility test).
 
 ### Final numbers and verdict
 
-| | Baseline | Final |
+| | Baseline (Nebius, agent-only) | After tuning (H100, iter 1 config) |
 |---|---|---|
-| P95 e2e latency | TBD | TBD |
-| Sustained RPS | TBD | TBD |
-| Eval pass rate | 43.3 % | TBD (`results/eval_after_tuning.json`) |
+| P95 e2e latency (10 RPS) | n/a | **110.7 s** ❌ (target 5 s) |
+| Best feasible operating point | n/a | **~3 RPS**, p50 2.5 s ✅ / p95 12 s ❌ |
+| Eval pass rate (overall) | 43.3 % | **43.3 %** ✅ unchanged |
+| Eval pass rate (iter 0 / 1 / 2) | 40.0 % / 43.3 % / 43.3 % | 40.0 % / 43.3 % / 43.3 % ✅ unchanged |
 
-Verdict: **TBD — hit / missed with gap of N seconds / N RPS.** Quality survived or regressed by [Δ pp].
+**Verdict — SLO missed, but with a metric-grounded diagnosis.** At the assignment SLO (p95 < 5 s at 10 RPS) the system is **22 × over latency** with a 63 % failure rate. Underlying cause is throughput saturation: at 10 agent-RPS the agent issues 20-30 LLM calls/s, vLLM completes ~20/s on this 30B model on one H100, so the per-call queue grows without bound. None of the three Phase 6 changes moved the SLO; the iter 1 baseline was the best tested config. At a 3 × lower request rate (3 RPS) the system is healthy on p50 but still misses p95 because of agent 3-iteration tail latency, which is a quality-architecture decision rather than a serving-config one. **Quality survived perfectly — eval pass rate is unchanged at 43.3 % from Nebius baseline.**
 
 ---
 
